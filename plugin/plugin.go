@@ -90,6 +90,8 @@ package plugin // import "collectd.org/plugin"
 // derive_t  value_list_get_derive  (value_list_t *, size_t);
 // gauge_t   value_list_get_gauge   (value_list_t *, size_t);
 //
+// typedef int (*plugin_complex_config_cb)(oconfig_item_t);
+//
 // int wrap_read_callback(user_data_t *);
 //
 // int register_write_wrapper (char const *, plugin_write_cb, user_data_t *);
@@ -97,11 +99,15 @@ package plugin // import "collectd.org/plugin"
 //
 // int register_shutdown_wrapper (char *, plugin_shutdown_cb);
 // int wrap_shutdown_callback(void);
+//
+// int register_complex_config_wrapper (char *, plugin_complex_config_cb);
+// int process_complex_config(oconfig_item_t);
 import "C"
 
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"unsafe"
 
 	"collectd.org/api"
@@ -332,6 +338,7 @@ var shutdownFuncs = make(map[string]Shutter)
 
 //export wrap_shutdown_callback
 func wrap_shutdown_callback() C.int {
+	fmt.Println("wrap_shutdown_callback called")
 	if len(shutdownFuncs) <= 0 {
 		return 0
 	}
@@ -361,6 +368,55 @@ func RegisterShutdown(name string, s Shutter) error {
 	}
 	shutdownFuncs[name] = s
 	return nil
+}
+
+// Configuration defines the interface for complex_configure callbacks, i.e. Go
+// structs that can hold and validate a configuration
+type Configuration interface {
+	Validate() error
+}
+
+var config_target Configuration
+var Configured chan struct{}
+
+// process_complex_config handles the actual translation of an oconfig_item_t
+//export process_complex_config
+func process_complex_config(oconfig C.oconfig_item_t) C.int {
+	o := reflect.ValueOf(config_target)
+
+	fmt.Println("process_complex_config called")
+
+	if oconfig.values_num > 1 { // multiple values, need a slice
+		key := C.GoString(oconfig.key)
+		if o.Elem().FieldByName(key).Kind() == reflect.Slice {
+			// TODO: handle a slice of values
+		} else {
+			// We received multiple values, but the supplied config struct can only
+			// handle one here
+			// TODO: warn the user
+			return C.int(1)
+		}
+	} else if oconfig.values_num == 1 { // single value
+	}
+	return C.int(1)
+}
+
+// RequestConfiguration registers a Configuration struct with the daemon and
+// requests a callback to fill it in. It returns a channel which will be
+// closed when a configuration has been loaded
+func RequestConfiguration(name string, c Configuration) (Configured chan struct{}, err error) {
+	// TODO: consider any possible sanity checking that could apply here
+	config_target = c
+	cName := C.CString(name)
+	cCallback := C.plugin_complex_config_cb(C.process_complex_config)
+	status, err := C.register_complex_config_wrapper(cName, cCallback)
+	if err != nil {
+		Errorf("register_complex_config_wrapper failed with status %v", status)
+		return nil, err
+	}
+	Configured = make(chan struct{})
+	fmt.Println("Config Requsted")
+	return Configured, nil
 }
 
 //export module_register

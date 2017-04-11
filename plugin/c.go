@@ -8,6 +8,8 @@ package plugin // import "collectd.org/plugin"
 // #include <stdlib.h>
 // #include <dlfcn.h>
 //
+// typedef int (*plugin_complex_config_cb)(oconfig_item_t);
+//
 // int (*register_read_ptr) (char const *group, char const *name,
 //     plugin_read_cb callback,
 //     cdtime_t interval,
@@ -97,5 +99,16 @@ package plugin // import "collectd.org/plugin"
 //   }
 //   return (*register_shutdown_ptr) (name, callback);
 //
+// }
+//
+//
+// int (*register_complex_config_ptr) (char *, plugin_complex_config_cb);
+// int register_complex_config_wrapper (char *name, plugin_complex_config_cb callback) {
+//   if (register_complex_config_ptr == NULL) {
+//     void *hnd = dlopen(NULL, RTLD_LAZY);
+//     register_complex_config_ptr = dlsym(hnd, "plugin_register_complex_config");
+//     dlclose(hnd);
+//   }
+//   return (*register_complex_config_ptr) (name, callback);
 // }
 import "C"
