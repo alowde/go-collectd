@@ -8,7 +8,7 @@ package plugin // import "collectd.org/plugin"
 // #include <stdlib.h>
 // #include <dlfcn.h>
 //
-// typedef int (*plugin_complex_config_cb)(oconfig_item_t);
+// typedef int (*plugin_complex_config_cb)(oconfig_item_t*);
 //
 // int (*register_read_ptr) (char const *group, char const *name,
 //     plugin_read_cb callback,
@@ -101,6 +101,10 @@ package plugin // import "collectd.org/plugin"
 //
 // }
 //
+// char *process_string_value (oconfig_item_t *ci, int i) {
+//	errno = EINVAL;
+//   return ci->values[i].value.string;
+// }
 //
 // int (*register_complex_config_ptr) (char *, plugin_complex_config_cb);
 // int register_complex_config_wrapper (char *name, plugin_complex_config_cb callback) {

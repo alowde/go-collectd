@@ -101,17 +101,17 @@ package plugin // import "collectd.org/plugin"
 // int wrap_shutdown_callback(void);
 //
 // int register_complex_config_wrapper (char *, plugin_complex_config_cb);
-// int process_complex_config(oconfig_item_t);
+// int process_complex_config(oconfig_item_t*);
+// char *process_string_value(oconfig_item_t*, int);
 import "C"
 
 import (
+	"collectd.org/api"
+	"collectd.org/cdtime"
 	"context"
 	"fmt"
 	"reflect"
 	"unsafe"
-
-	"collectd.org/api"
-	"collectd.org/cdtime"
 )
 
 var (
@@ -379,26 +379,55 @@ type Configuration interface {
 var config_target Configuration
 var Configured chan struct{}
 
+// TODO: wrap the received pointer
+
 // process_complex_config handles the actual translation of an oconfig_item_t
 //export process_complex_config
-func process_complex_config(oconfig C.oconfig_item_t) C.int {
-	o := reflect.ValueOf(config_target)
+func process_complex_config(oconfig *C.oconfig_item_t) C.int {
 
 	fmt.Println("process_complex_config called")
+	alignConfig(oconfig, config_target)
+	return C.int(0)
+
+}
+
+// alignConfig takes an oconfig_item_t struct and a Go struct and attempts to
+// line them up, calling itself recursively as required.
+func alignConfig(oconfig *C.oconfig_item_t, target interface{}) error {
+	fmt.Println("alignConfig called")
+	fmt.Printf("Starting with %v children and %v values", oconfig.children_num, oconfig.values_num)
+
+	t := reflect.ValueOf(target)
 
 	if oconfig.values_num > 1 { // multiple values, need a slice
+		fmt.Println("multiple values")
 		key := C.GoString(oconfig.key)
-		if o.Elem().FieldByName(key).Kind() == reflect.Slice {
+		if t.Elem().FieldByName(key).Kind() == reflect.Slice {
 			// TODO: handle a slice of values
 		} else {
 			// We received multiple values, but the supplied config struct can only
 			// handle one here
-			// TODO: warn the user
-			return C.int(1)
+			return fmt.Errorf("received multiple values but didn't have a slice to put them in")
 		}
-	} else if oconfig.values_num == 1 { // single value
+		//} else if oconfig.values_num == 1 { // single value
+		//	fmt.Println("single value")
+		//	return nil
+	} else if oconfig.children_num > 0 { // a container of children
+		fmt.Println(oconfig.values_num)
+		fmt.Printf("\nfound structish with %T %v children\n\n", oconfig.children_num, oconfig.children_num)
+		// two ways that we could emulate C pointer arithmetic, this one works at least
+		start := unsafe.Pointer(oconfig.children)
+		size := unsafe.Sizeof(*oconfig.children)
+
+		for i := 0; i < int(oconfig.children_num); i++ {
+			child := *(*C.oconfig_item_t)(unsafe.Pointer(uintptr(start) + size*uintptr(i)))
+			fmt.Printf("Child number %v is named %v, has %v values and %v children\n", i, C.GoString(child.key), child.values_num, child.children_num)
+
+		}
+		return nil
 	}
-	return C.int(1)
+	fmt.Println("nothing matched?")
+	return nil
 }
 
 // RequestConfiguration registers a Configuration struct with the daemon and
