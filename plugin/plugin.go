@@ -102,7 +102,7 @@ package plugin // import "collectd.org/plugin"
 //
 // int register_complex_config_wrapper (char *, plugin_complex_config_cb);
 // int process_complex_config(oconfig_item_t*);
-// char *process_string_value(oconfig_item_t*, int);
+// char *go_get_string_value(oconfig_item_t*, int);
 import "C"
 
 import (
@@ -376,66 +376,113 @@ type Configuration interface {
 	Validate() error
 }
 
-var config_target Configuration
+var config_target *Configuration
 var Configured chan struct{}
 
-// TODO: wrap the received pointer
+// getOconfigChildren takes a C.oconfig_item_t and returns an array of pointers
+// to its child items. Getting the child pointers requires a little more arithmetic
+// than in C as we can't just increment a pointer to get the next array item
+func getOconfigChildren(oconfig *C.oconfig_item_t) (output []*C.oconfig_item_t) {
+	start := unsafe.Pointer(oconfig.children)
+	size := unsafe.Sizeof(*oconfig.children)
+	for i := 0; i < int(oconfig.children_num); i++ {
+		child := (*C.oconfig_item_t)(unsafe.Pointer(uintptr(start) + size*uintptr(i)))
+		output = append(output, child)
+	}
+	return
+}
 
-// process_complex_config handles the actual translation of an oconfig_item_t
+// process_complex_config receives the plugin config from Collectd
 //export process_complex_config
 func process_complex_config(oconfig *C.oconfig_item_t) C.int {
-
 	fmt.Println("process_complex_config called")
-	alignConfig(oconfig, config_target)
+	target := reflect.ValueOf(*config_target)
+	originaltarget := target.Elem()
+	err := alignConfig(oconfig, originaltarget, true)
+	if err != nil {
+		fmt.Printf("Error: Invalid configuration %v\n", err)
+		return C.int(1)
+	}
+	fmt.Println("config_target")
+	fmt.Println(*config_target)
+	fmt.Println(originaltarget)
+	close(Configured)
 	return C.int(0)
-
 }
 
 // alignConfig takes an oconfig_item_t struct and a Go struct and attempts to
 // line them up, calling itself recursively as required.
-func alignConfig(oconfig *C.oconfig_item_t, target interface{}) error {
-	fmt.Println("alignConfig called")
-	fmt.Printf("Starting with %v children and %v values", oconfig.children_num, oconfig.values_num)
+func alignConfig(oconfig *C.oconfig_item_t, target reflect.Value, isRoot bool) error {
+	fmt.Printf("\n---\nalignConfig with %v children and %v values\n", oconfig.children_num, oconfig.values_num)
 
-	t := reflect.ValueOf(target)
-
-	if oconfig.values_num > 1 { // multiple values, need a slice
-		fmt.Println("multiple values")
-		key := C.GoString(oconfig.key)
-		if t.Elem().FieldByName(key).Kind() == reflect.Slice {
-			// TODO: handle a slice of values
-		} else {
-			// We received multiple values, but the supplied config struct can only
-			// handle one here
-			return fmt.Errorf("received multiple values but didn't have a slice to put them in")
+	if isRoot != true { // have to skip this check on the root
+		if err := checkMatchable(oconfig, target); err != nil {
+			return fmt.Errorf("unmatchable values (%v)", err)
 		}
-		//} else if oconfig.values_num == 1 { // single value
-		//	fmt.Println("single value")
-		//	return nil
-	} else if oconfig.children_num > 0 { // a container of children
-		fmt.Println(oconfig.values_num)
-		fmt.Printf("\nfound structish with %T %v children\n\n", oconfig.children_num, oconfig.children_num)
-		// two ways that we could emulate C pointer arithmetic, this one works at least
-		start := unsafe.Pointer(oconfig.children)
-		size := unsafe.Sizeof(*oconfig.children)
-
-		for i := 0; i < int(oconfig.children_num); i++ {
-			child := *(*C.oconfig_item_t)(unsafe.Pointer(uintptr(start) + size*uintptr(i)))
-			fmt.Printf("Child number %v is named %v, has %v values and %v children\n", i, C.GoString(child.key), child.values_num, child.children_num)
-
-		}
-		return nil
 	}
-	fmt.Println("nothing matched?")
+
+	//key := C.GoString(oconfig.key) // find the name of the working config section
+
+	if oconfig.values_num > 1 { // multiple values
+		return nil
+
+	} else if (oconfig.values_num == 1) && (isRoot == false) { // single value
+		target.SetString(C.GoString(C.go_get_string_value(oconfig, C.int(0))))
+		fmt.Println(target)
+		return nil
+
+	} else if oconfig.children_num > 0 { // a container of oconfig children
+
+		for _, child := range getOconfigChildren(oconfig) { // for each child
+			childkey := C.GoString(child.key)
+			if target.FieldByName(childkey).IsValid() != true { // if there's no corresponding target field, skip it
+				fmt.Printf("Ignoring unexpected key: %v\n", childkey)
+				continue
+			}
+			fmt.Println("found child with corresponding struct, attempting to recurse")
+			if err := alignConfig(child, target.FieldByName(childkey), false); err != nil {
+				return fmt.Errorf("alignconfig failed: %v\n", err)
+			}
+
+		}
+
+	} else {
+		fmt.Println("Odd child missed major conditionals")
+	}
+	return nil
+
+}
+
+func checkMatchable(oconfig *C.oconfig_item_t, target reflect.Value) error {
+	//key := C.GoString(oconfig.key)
+	if oconfig.children_num > 0 { // if it has children we need a struct
+		if target.Kind() != reflect.Struct {
+			return fmt.Errorf("did not have corresponding struct (had )")
+		}
+	}
+	if oconfig.values_num > 1 { // if it has multiple values it must be a slice
+		if target.Kind() != reflect.Slice {
+			return fmt.Errorf("did not have corresponding slice")
+		}
+	}
+	if oconfig.values_num == 1 { // if it has a single value we need either a string, int or bool
+		switch target.Kind() {
+		case reflect.String:
+		case reflect.Int:
+		case reflect.Bool:
+		default:
+			return fmt.Errorf("did not have either corresponding string, int, or bool (was %v)", target.Kind())
+		}
+	}
 	return nil
 }
 
 // RequestConfiguration registers a Configuration struct with the daemon and
 // requests a callback to fill it in. It returns a channel which will be
 // closed when a configuration has been loaded
-func RequestConfiguration(name string, c Configuration) (Configured chan struct{}, err error) {
+func RequestConfiguration(name string, c Configuration) (chan struct{}, error) {
 	// TODO: consider any possible sanity checking that could apply here
-	config_target = c
+	config_target = &c
 	cName := C.CString(name)
 	cCallback := C.plugin_complex_config_cb(C.process_complex_config)
 	status, err := C.register_complex_config_wrapper(cName, cCallback)
