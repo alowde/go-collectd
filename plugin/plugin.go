@@ -103,6 +103,9 @@ package plugin // import "collectd.org/plugin"
 // int register_complex_config_wrapper (char *, plugin_complex_config_cb);
 // int process_complex_config(oconfig_item_t*);
 // char *go_get_string_value(oconfig_item_t*, int);
+// double go_get_number_value(oconfig_item_t*, int);
+// int go_get_boolean_value(oconfig_item_t*, int);
+// int go_get_value_type(oconfig_item_t*, int);
 import "C"
 
 import (
@@ -415,7 +418,8 @@ func process_complex_config(oconfig *C.oconfig_item_t) C.int {
 func alignConfig(oconfig *C.oconfig_item_t, target reflect.Value, isRoot bool) error {
 	fmt.Printf("\n---\nalignConfig with %v children and %v values\n", oconfig.children_num, oconfig.values_num)
 
-	if isRoot != true { // have to skip this check on the root
+	// root oconfig_item has an unreadable value, so don't check if it can be matched
+	if isRoot != true {
 		if err := checkMatchable(oconfig, target); err != nil {
 			return fmt.Errorf("unmatchable values (%v)", err)
 		}
@@ -450,14 +454,36 @@ func alignConfig(oconfig *C.oconfig_item_t, target reflect.Value, isRoot bool) e
 		fmt.Println("Odd child missed major conditionals")
 	}
 	return nil
+}
+
+// assignValue copies a oconfig_value to a target Value using the appropriate function
+func assignValue(oconfig_item *C.oconfig_item_t, target reflect.Value) error {
+	valType, err := C.go_get_value_type(oconfig_item, C.int(0))
+	if err != nil {
+		return fmt.Errorf("unable to determine type of value")
+	}
+	switch valType {
+	case C.int(0): //string
+		target.SetString(C.GoString(C.go_get_string_value(oconfig_item, C.int(0))))
+	case C.int(1): // number/double/float64
+		target.SetFloat(float64(C.go_get_number_value(oconfig_item, C.int(0))))
+	case C.int(2): // boolean
+		target.SetBool(C.go_get_number_value(oconfig_item, C.int(0)) == 1)
+	default: // Unknown type
+		return fmt.Errorf("unknown type of value")
+	}
+	target.SetString(C.GoString(C.go_get_string_value(oconfig_item, C.int(0))))
+	fmt.Println(target)
+	return nil
 
 }
 
+// checkMatchable returns an error if the provided source cannot be copied
+// to the target, or nil if it's OK
 func checkMatchable(oconfig *C.oconfig_item_t, target reflect.Value) error {
-	//key := C.GoString(oconfig.key)
 	if oconfig.children_num > 0 { // if it has children we need a struct
 		if target.Kind() != reflect.Struct {
-			return fmt.Errorf("did not have corresponding struct (had )")
+			return fmt.Errorf("did not have corresponding struct")
 		}
 	}
 	if oconfig.values_num > 1 { // if it has multiple values it must be a slice
@@ -468,7 +494,7 @@ func checkMatchable(oconfig *C.oconfig_item_t, target reflect.Value) error {
 	if oconfig.values_num == 1 { // if it has a single value we need either a string, int or bool
 		switch target.Kind() {
 		case reflect.String:
-		case reflect.Int:
+		case reflect.Float64:
 		case reflect.Bool:
 		default:
 			return fmt.Errorf("did not have either corresponding string, int, or bool (was %v)", target.Kind())

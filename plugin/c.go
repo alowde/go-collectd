@@ -101,9 +101,36 @@ package plugin // import "collectd.org/plugin"
 //
 // }
 //
-// char *process_string_value (oconfig_item_t *ci, int i) {
-//	errno = EINVAL;
-//   return ci->values[i].value.string;
+// double go_get_number_value (oconfig_item_t *ci, int i) {
+//	if (i >= ci->values_num) {
+//		errno = EINVAL;
+//		return 0;
+//	}
+//	return ci->values[i].value.number;
+// }
+//
+// int go_get_boolean_value (oconfig_item_t *ci, int i) {
+//	if (i >= ci->values_num) {
+//		errno = EINVAL;
+//		return 0;
+//	}
+//	return ci->values[i].value.boolean;
+// }
+//
+// char *go_get_string_value (oconfig_item_t *ci, int i) {
+//	if (i >= ci->values_num) {
+//		errno = EINVAL;
+//		return "";
+//	}
+//	return ci->values[i].value.string;
+// }
+//
+// int go_get_value_type (oconfig_item_t *ci, int i) {
+//	if (i >= ci->values_num) {
+//		errno = EINVAL;
+//		return -1;
+//	}
+//	return ci->values[i].type;
 // }
 //
 // int (*register_complex_config_ptr) (char *, plugin_complex_config_cb);
