@@ -399,16 +399,13 @@ func getOconfigChildren(oconfig *C.oconfig_item_t) (output []*C.oconfig_item_t) 
 //export process_complex_config
 func process_complex_config(oconfig *C.oconfig_item_t) C.int {
 	fmt.Println("process_complex_config called")
-	target := reflect.ValueOf(*config_target)
-	originaltarget := target.Elem()
-	err := alignConfig(oconfig, originaltarget, true)
+	target := reflect.ValueOf(*config_target).Elem()
+	err := alignConfig(oconfig, target, true)
 	if err != nil {
 		fmt.Printf("Error: Invalid configuration %v\n", err)
 		return C.int(1)
 	}
-	fmt.Println("config_target")
-	fmt.Println(*config_target)
-	fmt.Println(originaltarget)
+	fmt.Printf("*config_target is %#v\n", *config_target)
 	close(Configured)
 	return C.int(0)
 }
@@ -416,24 +413,21 @@ func process_complex_config(oconfig *C.oconfig_item_t) C.int {
 // alignConfig takes an oconfig_item_t struct and a Go struct and attempts to
 // line them up, calling itself recursively as required.
 func alignConfig(oconfig *C.oconfig_item_t, target reflect.Value, isRoot bool) error {
-	fmt.Printf("\n---\nalignConfig with %v children and %v values\n", oconfig.children_num, oconfig.values_num)
+	//	fmt.Printf("\n---\nalignConfig with %v children and %v values\n", oconfig.children_num, oconfig.values_num)
 
 	// root oconfig_item has an unreadable value, so don't check if it can be matched
 	if isRoot != true {
 		if err := checkMatchable(oconfig, target); err != nil {
-			return fmt.Errorf("unmatchable values (%v)", err)
+			return fmt.Errorf("unmatchable value (%v)", err)
 		}
 	}
 
-	//key := C.GoString(oconfig.key) // find the name of the working config section
-
-	if oconfig.values_num > 1 { // multiple values
-		return nil
-
+	if int(oconfig.values_num) > 1 { // multiple values
+		assignSlice(oconfig, target)
+		//fmt.Printf("assignSlice returned %v\n", target)
 	} else if (oconfig.values_num == 1) && (isRoot == false) { // single value
-		target.SetString(C.GoString(C.go_get_string_value(oconfig, C.int(0))))
-		fmt.Println(target)
-		return nil
+		assignValue(oconfig, target, 0)
+		//fmt.Printf("assignValue returned %v\n", target)
 
 	} else if oconfig.children_num > 0 { // a container of oconfig children
 
@@ -443,39 +437,47 @@ func alignConfig(oconfig *C.oconfig_item_t, target reflect.Value, isRoot bool) e
 				fmt.Printf("Ignoring unexpected key: %v\n", childkey)
 				continue
 			}
-			fmt.Println("found child with corresponding struct, attempting to recurse")
+			//			fmt.Println("found child with corresponding struct, attempting to recurse")
 			if err := alignConfig(child, target.FieldByName(childkey), false); err != nil {
-				return fmt.Errorf("alignconfig failed: %v\n", err)
+				return fmt.Errorf("in %v: %v\n", childkey, err)
 			}
-
+			//fmt.Printf("alignConfig returned %v\n", target)
 		}
 
-	} else {
-		fmt.Println("Odd child missed major conditionals")
 	}
 	return nil
 }
 
+// assignSlice generates a slice of the target type and assigns it to the target
+func assignSlice(oconfig_item *C.oconfig_item_t, target reflect.Value) error {
+	//fmt.Println("multival case")
+	s := reflect.MakeSlice(target.Type(), int(oconfig_item.values_num), int(oconfig_item.values_num))
+	for i := 0; i < int(oconfig_item.values_num); i++ {
+		assignValue(oconfig_item, s.Index(i), i)
+	}
+	target.Set(s)
+	//fmt.Printf("At end of assignslice target is %v\n", target)
+	return nil
+}
+
 // assignValue copies a oconfig_value to a target Value using the appropriate function
-func assignValue(oconfig_item *C.oconfig_item_t, target reflect.Value) error {
-	valType, err := C.go_get_value_type(oconfig_item, C.int(0))
+func assignValue(oconfig_item *C.oconfig_item_t, target reflect.Value, index int) error {
+	valType, err := C.go_get_value_type(oconfig_item, C.int(index))
 	if err != nil {
 		return fmt.Errorf("unable to determine type of value")
 	}
 	switch valType {
 	case C.int(0): //string
-		target.SetString(C.GoString(C.go_get_string_value(oconfig_item, C.int(0))))
+		target.SetString(C.GoString(C.go_get_string_value(oconfig_item, C.int(index))))
 	case C.int(1): // number/double/float64
-		target.SetFloat(float64(C.go_get_number_value(oconfig_item, C.int(0))))
+		target.SetFloat(float64(C.go_get_number_value(oconfig_item, C.int(index))))
 	case C.int(2): // boolean
-		target.SetBool(C.go_get_number_value(oconfig_item, C.int(0)) == 1)
+		target.SetBool(C.go_get_number_value(oconfig_item, C.int(index)) == 1)
 	default: // Unknown type
-		return fmt.Errorf("unknown type of value")
+		return fmt.Errorf("unsupported config item type")
 	}
-	target.SetString(C.GoString(C.go_get_string_value(oconfig_item, C.int(0))))
-	fmt.Println(target)
+	//fmt.Printf("At end of assignValue target is %v\n", target)
 	return nil
-
 }
 
 // checkMatchable returns an error if the provided source cannot be copied
@@ -492,12 +494,25 @@ func checkMatchable(oconfig *C.oconfig_item_t, target reflect.Value) error {
 		}
 	}
 	if oconfig.values_num == 1 { // if it has a single value we need either a string, int or bool
-		switch target.Kind() {
-		case reflect.String:
-		case reflect.Float64:
-		case reflect.Bool:
+		valType, err := C.go_get_value_type(oconfig, C.int(0))
+		if err != nil {
+			return fmt.Errorf("unable to determine type of value")
+		}
+		switch valType {
+		case C.int(0): //string
+			if target.Kind() != reflect.String {
+				return fmt.Errorf("did not have corresponding string")
+			}
+		case C.int(1): // number/double/float64
+			if target.Kind() != reflect.Float64 {
+				return fmt.Errorf("did not have corresponding float64")
+			}
+		case C.int(2): // boolean
+			if target.Kind() != reflect.Bool {
+				return fmt.Errorf("did not have corresponding bool")
+			}
 		default:
-			return fmt.Errorf("did not have either corresponding string, int, or bool (was %v)", target.Kind())
+			return fmt.Errorf("unsupported config item type")
 		}
 	}
 	return nil
