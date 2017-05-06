@@ -380,9 +380,11 @@ type Configuration interface {
 }
 
 var config_target *Configuration
-var Configured chan struct{}
+var config_targets map[string]*Configuration
 
-// getOconfigChildren takes a C.oconfig_item_t and returns an array of pointers
+var configured map[string]chan struct{}
+
+// getOconfigChildren takes a C.oconfig_item_t and returns an array of Go pointers
 // to its child items. Getting the child pointers requires a little more arithmetic
 // than in C as we can't just increment a pointer to get the next array item
 func getOconfigChildren(oconfig *C.oconfig_item_t) (output []*C.oconfig_item_t) {
@@ -395,68 +397,40 @@ func getOconfigChildren(oconfig *C.oconfig_item_t) (output []*C.oconfig_item_t) 
 	return
 }
 
-// process_complex_config receives the plugin config from Collectd
-//export process_complex_config
-func process_complex_config(oconfig *C.oconfig_item_t) C.int {
-	fmt.Println("process_complex_config called")
-	target := reflect.ValueOf(*config_target).Elem()
-	err := alignConfig(oconfig, target, true)
-	if err != nil {
-		fmt.Printf("Error: Invalid configuration %v\n", err)
-		return C.int(1)
-	}
-	fmt.Printf("*config_target is %#v\n", *config_target)
-	close(Configured)
-	return C.int(0)
-}
-
-// alignConfig takes an oconfig_item_t struct and a Go struct and attempts to
-// line them up, calling itself recursively as required.
-func alignConfig(oconfig *C.oconfig_item_t, target reflect.Value, isRoot bool) error {
-	//	fmt.Printf("\n---\nalignConfig with %v children and %v values\n", oconfig.children_num, oconfig.values_num)
-
-	// root oconfig_item has an unreadable value, so don't check if it can be matched
-	if isRoot != true {
-		if err := checkMatchable(oconfig, target); err != nil {
-			return fmt.Errorf("unmatchable value (%v)", err)
+// checkMatchable returns an error if the provided source cannot be copied to the target, or nil if it's OK
+func checkMatchable(oconfig *C.oconfig_item_t, target reflect.Value) error {
+	if oconfig.children_num > 0 { // if it has children we need a corresponding struct
+		if target.Kind() != reflect.Struct {
+			return fmt.Errorf("did not have corresponding struct")
 		}
 	}
-
-	if int(oconfig.values_num) > 1 { // multiple values
-		assignSlice(oconfig, target)
-		//fmt.Printf("assignSlice returned %v\n", target)
-	} else if (oconfig.values_num == 1) && (isRoot == false) { // single value
-		assignValue(oconfig, target, 0)
-		//fmt.Printf("assignValue returned %v\n", target)
-
-	} else if oconfig.children_num > 0 { // a container of oconfig children
-
-		for _, child := range getOconfigChildren(oconfig) { // for each child
-			childkey := C.GoString(child.key)
-			if target.FieldByName(childkey).IsValid() != true { // if there's no corresponding target field, skip it
-				fmt.Printf("Ignoring unexpected key: %v\n", childkey)
-				continue
-			}
-			//			fmt.Println("found child with corresponding struct, attempting to recurse")
-			if err := alignConfig(child, target.FieldByName(childkey), false); err != nil {
-				return fmt.Errorf("in %v: %v\n", childkey, err)
-			}
-			//fmt.Printf("alignConfig returned %v\n", target)
+	if oconfig.values_num > 1 { // if it has multiple values we need a slice
+		if target.Kind() != reflect.Slice {
+			return fmt.Errorf("did not have corresponding slice")
 		}
-
 	}
-	return nil
-}
-
-// assignSlice generates a slice of the target type and assigns it to the target
-func assignSlice(oconfig_item *C.oconfig_item_t, target reflect.Value) error {
-	//fmt.Println("multival case")
-	s := reflect.MakeSlice(target.Type(), int(oconfig_item.values_num), int(oconfig_item.values_num))
-	for i := 0; i < int(oconfig_item.values_num); i++ {
-		assignValue(oconfig_item, s.Index(i), i)
+	if oconfig.values_num == 1 { // if it has a single value we need either a string, int or bool
+		valType, err := C.go_get_value_type(oconfig, C.int(0))
+		if err != nil {
+			return fmt.Errorf("unable to determine type of value")
+		}
+		switch valType {
+		case C.int(0): //string
+			if target.Kind() != reflect.String {
+				return fmt.Errorf("found string, needed %v", target.Kind().String())
+			}
+		case C.int(1): // number/double/float64
+			if target.Kind() != reflect.Float64 {
+				return fmt.Errorf("found number, needed %v", target.Kind().String())
+			}
+		case C.int(2): // boolean
+			if target.Kind() != reflect.Bool {
+				return fmt.Errorf("found boolean, needed %v", target.Kind().String())
+			}
+		default:
+			return fmt.Errorf("unsupported Collectd config item type")
+		}
 	}
-	target.Set(s)
-	//fmt.Printf("At end of assignslice target is %v\n", target)
 	return nil
 }
 
@@ -476,43 +450,43 @@ func assignValue(oconfig_item *C.oconfig_item_t, target reflect.Value, index int
 	default: // Unknown type
 		return fmt.Errorf("unsupported config item type")
 	}
-	//fmt.Printf("At end of assignValue target is %v\n", target)
 	return nil
 }
 
-// checkMatchable returns an error if the provided source cannot be copied
-// to the target, or nil if it's OK
-func checkMatchable(oconfig *C.oconfig_item_t, target reflect.Value) error {
-	if oconfig.children_num > 0 { // if it has children we need a struct
-		if target.Kind() != reflect.Struct {
-			return fmt.Errorf("did not have corresponding struct")
+// assignSlice generates a slice of the target type, loads in each value and assigns it to the target
+func assignSlice(oconfig_item *C.oconfig_item_t, target reflect.Value) error {
+	s := reflect.MakeSlice(target.Type(), int(oconfig_item.values_num), int(oconfig_item.values_num))
+	for i := 0; i < int(oconfig_item.values_num); i++ {
+		assignValue(oconfig_item, s.Index(i), i)
+	}
+	target.Set(s)
+	return nil
+}
+
+// assignConfig takes an oconfig_item_t struct and attempts to assign data to corresponding
+// fields in the provided config_target. A lack of corresponding field is not an error, a
+// corresponding field of the wrong type is.
+func assignConfig(oconfig *C.oconfig_item_t, target reflect.Value, isRoot bool) error {
+	// root oconfig_item's value is the name of the plugin and unused here
+	if isRoot != true {
+		if err := checkMatchable(oconfig, target); err != nil {
+			return fmt.Errorf("unmatchable value (%v)", err)
 		}
 	}
-	if oconfig.values_num > 1 { // if it has multiple values it must be a slice
-		if target.Kind() != reflect.Slice {
-			return fmt.Errorf("did not have corresponding slice")
-		}
-	}
-	if oconfig.values_num == 1 { // if it has a single value we need either a string, int or bool
-		valType, err := C.go_get_value_type(oconfig, C.int(0))
-		if err != nil {
-			return fmt.Errorf("unable to determine type of value")
-		}
-		switch valType {
-		case C.int(0): //string
-			if target.Kind() != reflect.String {
-				return fmt.Errorf("did not have corresponding string")
+	if int(oconfig.values_num) > 1 { // multiple values
+		assignSlice(oconfig, target)
+	} else if (oconfig.values_num == 1) && (isRoot == false) { // single value
+		assignValue(oconfig, target, 0)
+	} else if oconfig.children_num > 0 { // a container of oconfig children
+		for _, child := range getOconfigChildren(oconfig) {
+			childkey := C.GoString(child.key)
+			if target.FieldByName(childkey).IsValid() != true { // if there's no corresponding target field, skip it
+				fmt.Printf("Ignoring unexpected key in config: %v\n", childkey)
+				continue
 			}
-		case C.int(1): // number/double/float64
-			if target.Kind() != reflect.Float64 {
-				return fmt.Errorf("did not have corresponding float64")
+			if err := assignConfig(child, target.FieldByName(childkey), false); err != nil {
+				return fmt.Errorf("in %v: %v\n", childkey, err)
 			}
-		case C.int(2): // boolean
-			if target.Kind() != reflect.Bool {
-				return fmt.Errorf("did not have corresponding bool")
-			}
-		default:
-			return fmt.Errorf("unsupported config item type")
 		}
 	}
 	return nil
@@ -520,10 +494,15 @@ func checkMatchable(oconfig *C.oconfig_item_t, target reflect.Value) error {
 
 // RequestConfiguration registers a Configuration struct with the daemon and
 // requests a callback to fill it in. It returns a channel which will be
-// closed when a configuration has been loaded
+// closed when a configuration has been loaded successfully
 func RequestConfiguration(name string, c Configuration) (chan struct{}, error) {
 	// TODO: consider any possible sanity checking that could apply here
-	config_target = &c
+	if len(config_targets) == 0 {
+		config_targets = make(map[string]*Configuration)
+		configured = make(map[string]chan struct{})
+	}
+	config_targets[name] = &c
+	configured[name] = make(chan struct{})
 	cName := C.CString(name)
 	cCallback := C.plugin_complex_config_cb(C.process_complex_config)
 	status, err := C.register_complex_config_wrapper(cName, cCallback)
@@ -531,9 +510,37 @@ func RequestConfiguration(name string, c Configuration) (chan struct{}, error) {
 		Errorf("register_complex_config_wrapper failed with status %v", status)
 		return nil, err
 	}
-	Configured = make(chan struct{})
-	fmt.Println("Config Requsted")
-	return Configured, nil
+	return configured[name], nil
+}
+
+// process_complex_config receives the plugin config from Collectd and attempts to
+// initialise the target config. If the configuration is parsed without fatal errors
+// it calls the attached Validate() function, which allows the plugin developer to
+// confirm that they've received sufficient valid configuration. If that succeeds
+// we finally close the Configured channel to indicate that the configuration is now
+// assigned and validated.
+//export process_complex_config
+func process_complex_config(oconfig *C.oconfig_item_t) C.int {
+	oname := C.GoString(C.go_get_string_value(oconfig, C.int(0)))
+	var ok bool
+	if config_target, ok = config_targets[oname]; !ok {
+		fmt.Printf("Error: Received configuration for unknown plugin name %v\n", oname)
+		return C.int(1)
+	}
+	target := reflect.ValueOf(*config_target).Elem()
+	err := assignConfig(oconfig, target, true)
+	if err != nil {
+		fmt.Printf("Error: Invalid configuration %v\n", err)
+		return C.int(1)
+	}
+	valArgs := make([]reflect.Value, 0)
+	valResp := target.MethodByName("Validate").Call(valArgs)
+	if err := valResp[0].Interface(); err != nil {
+		fmt.Printf("Error: Plugin-specific validation returned error: %v\n", err)
+		return C.int(1)
+	}
+	close(configured[oname])
+	return C.int(0)
 }
 
 //export module_register
