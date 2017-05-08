@@ -354,8 +354,8 @@ func wrap_shutdown_callback() C.int {
 	return 0
 }
 
-// RegisterShutdown registers a shutdown function with the daemon which is called
-// when the plugin is required to shutdown gracefully.
+// RegisterShutdown registers a shutdown function with the daemon which is
+// called when the plugin is required to shutdown gracefully.
 func RegisterShutdown(name string, s Shutter) error {
 	// Only register a callback the first time one is implemented, subsequent
 	// callbacks get added to a list and called at the same time
@@ -384,9 +384,10 @@ var config_targets map[string]*Configuration
 
 var configured map[string]chan struct{}
 
-// getOconfigChildren takes a C.oconfig_item_t and returns an array of Go pointers
-// to its child items. Getting the child pointers requires a little more arithmetic
-// than in C as we can't just increment a pointer to get the next array item
+// getOconfigChildren takes a C.oconfig_item_t and returns an array of Go
+// pointers to its child items. Getting the child pointers requires a little
+// more arithmetic than in C as we can't just increment a pointer to get the
+// next array item
 func getOconfigChildren(oconfig *C.oconfig_item_t) (output []*C.oconfig_item_t) {
 	start := unsafe.Pointer(oconfig.children)
 	size := unsafe.Sizeof(*oconfig.children)
@@ -397,7 +398,8 @@ func getOconfigChildren(oconfig *C.oconfig_item_t) (output []*C.oconfig_item_t) 
 	return
 }
 
-// checkMatchable returns an error if the provided source cannot be copied to the target, or nil if it's OK
+// checkMatchable returns an error if the provided source cannot be copied to
+// the target, or nil if it's OK
 func checkMatchable(oconfig *C.oconfig_item_t, target reflect.Value) error {
 	if oconfig.children_num > 0 { // if it has children we need a corresponding struct
 		if target.Kind() != reflect.Struct {
@@ -417,21 +419,71 @@ func checkMatchable(oconfig *C.oconfig_item_t, target reflect.Value) error {
 		switch valType {
 		case C.int(0): //string
 			if target.Kind() != reflect.String {
-				return fmt.Errorf("found string, needed %v", target.Kind().String())
+				return fmt.Errorf("found string, plugin expects %v", target.Kind().String())
 			}
 		case C.int(1): // number/double/float64
 			if target.Kind() != reflect.Float64 {
-				return fmt.Errorf("found number, needed %v", target.Kind().String())
+				return fmt.Errorf("found number, plugin expects %v", target.Kind().String())
 			}
 		case C.int(2): // boolean
 			if target.Kind() != reflect.Bool {
-				return fmt.Errorf("found boolean, needed %v", target.Kind().String())
+				return fmt.Errorf("found boolean, plugin expects %v", target.Kind().String())
 			}
 		default:
 			return fmt.Errorf("unsupported Collectd config item type")
 		}
 	}
 	return nil
+}
+
+// checkUsable iterates over a provided reflect.Value and attempts to make sure
+// it A) contains only string, bool, or float64 fields, or slices or structs of
+// these, and B) contains only settable, exported fields
+// Unfortunately as we start with a reflect.Value and no reflect.Type we can't
+// actually report the name of the failing field. Fortunately this should be a
+// plugin error only (not possible for a user to trigger) and resolved during
+// notmal testing.
+func checkUsable(target reflect.Value) error {
+	switch target.Kind().String() {
+	case "struct":
+		for i := 0; i < target.NumField(); i++ {
+			err := checkUsable(target.Field(i))
+			if err != nil {
+				return fmt.Errorf("in struct: %v", err)
+			}
+		}
+	case "slice":
+		if target.CanSet() != true {
+			return fmt.Errorf("unsettable value (unexported field?)")
+		}
+		// Get an Interface of the slice, extract a field and get the field's type
+		switch reflect.TypeOf(target.Interface()).Elem().Kind() {
+		case reflect.String:
+		case reflect.Float64:
+		case reflect.Bool:
+		default:
+			return fmt.Errorf("unsupported variable type (slices must be of string, float64, or bool)")
+		}
+	case "string":
+		if target.CanSet() != true {
+			return fmt.Errorf("unsettable value (unexported field?)")
+		}
+		return nil
+	case "float64":
+		if target.CanSet() != true {
+			return fmt.Errorf("unsettable value (unexported field?)")
+		}
+		return nil
+	case "bool":
+		if target.CanSet() != true {
+			return fmt.Errorf("unsettable value (unexported field?)")
+		}
+		return nil
+	default:
+		fmt.Println(target.Kind().String())
+		return fmt.Errorf("unsupported variable type (must be string, float64, bool, or slice of these, or struct)")
+	}
+	return nil // here to keep the compiler happy
 }
 
 // assignValue copies a oconfig_value to a target Value using the appropriate function
@@ -496,7 +548,10 @@ func assignConfig(oconfig *C.oconfig_item_t, target reflect.Value, isRoot bool) 
 // requests a callback to fill it in. It returns a channel which will be
 // closed when a configuration has been loaded successfully
 func RequestConfiguration(name string, c Configuration) (chan struct{}, error) {
-	// TODO: consider any possible sanity checking that could apply here
+	if err := checkUsable(reflect.ValueOf(c).Elem()); err != nil {
+		fmt.Printf("while loading plugin received error: %v\n", err)
+		return nil, fmt.Errorf("plugin contains unusable configuration struct")
+	}
 	if len(config_targets) == 0 {
 		config_targets = make(map[string]*Configuration)
 		configured = make(map[string]chan struct{})
